@@ -2,6 +2,10 @@
 name = "server-function"
 version = "0.1.0"
 edition = "2021"
+description = "A macro for easy RPC creation"
+license = "MIT"
+repository = "https://github.com/r4nd0m1z3r/server-function"
+homepage = "https://github.com/r4nd0m1z3r/server-function"
 
 [lib]
 proc_macro=true
