@@ -6,9 +6,29 @@ use proc_macro::TokenStream as TokenStreamV1;
 use proc_macro2::{Delimiter, Ident, TokenStream as TokenStreamV2, TokenTree};
 use quote::{format_ident, quote};
 
-fn get_fn_name(mut tokens_iter: impl Iterator<Item = TokenTree>) -> Option<Ident> {
-    if let TokenTree::Ident(ident) = tokens_iter.nth(1)? {
-        Some(ident)
+fn get_fn_name(mut tokens_iter: impl Iterator<Item = TokenTree>) -> Option<(Ident, bool)> {
+    let mut is_next_token_fn_name = false;
+    let mut is_async = false;
+    let fn_name = tokens_iter.find(|token_tree| {
+        if is_next_token_fn_name {
+            return true;
+        }
+        if let TokenTree::Ident(ident) = token_tree {
+            if ident == "async" {
+                is_async = true;
+            }
+            if ident == "fn" {
+                is_next_token_fn_name = true;
+                return false;
+            } else {
+                return false;
+            }
+        }
+        false
+    })?;
+
+    if let TokenTree::Ident(ident) = fn_name {
+        Some((ident, is_async))
     } else {
         None
     }
@@ -71,6 +91,7 @@ fn generate_struct(
 }
 
 fn generate_thunk(
+    is_async: bool,
     fn_name: &Ident,
     struct_name: &Ident,
     return_type: Option<Ident>,
@@ -114,10 +135,26 @@ fn generate_thunk(
         .collect::<TokenStreamV2>();
 
     if let Some(return_type) = return_type {
+        if is_async {
+            Some(quote! {
+                async fn #thunk_name (args: #struct_name) -> #return_type {
+                    let #struct_name { #unwrap_stream } = args;
+                    #fn_name(#unwrap_stream).await
+                }
+            })
+        } else {
+            Some(quote! {
+                fn #thunk_name (args: #struct_name) -> #return_type {
+                    let #struct_name { #unwrap_stream } = args;
+                    #fn_name(#unwrap_stream)
+                }
+            })
+        }
+    } else if is_async {
         Some(quote! {
-            fn #thunk_name (args: #struct_name) -> #return_type {
+            async fn #thunk_name (args: #struct_name) {
                 let #struct_name { #unwrap_stream } = args;
-                #fn_name(#unwrap_stream)
+                #fn_name(#unwrap_stream).await;
             }
         })
     } else {
@@ -135,11 +172,12 @@ pub fn server_function(_attr: TokenStreamV1, item: TokenStreamV1) -> TokenStream
     let item = Into::<TokenStreamV2>::into(item);
     let mut item_iter = item.clone().into_iter();
 
-    let fn_name = get_fn_name(&mut item_iter).expect("Failed to get function name!");
+    let (fn_name, is_async) = get_fn_name(&mut item_iter).expect("Failed to get function name!");
     let (args_struct, args_struct_name) = generate_struct(&fn_name, &mut item_iter)
         .expect("Failed to generate function arguments struct!");
     let return_type = get_fn_return_type(&mut item_iter);
     let thunk = generate_thunk(
+        is_async,
         &fn_name,
         &args_struct_name,
         return_type,
