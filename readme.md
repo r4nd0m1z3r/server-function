@@ -29,3 +29,16 @@ This is a macro for RPC programming needs which generates a structure and a thun
     // will return 10, same as original function
     add_thunk(AddArgs { a: 5, b: 5 })
     ```
+
+## Features
+
+### messagepack
+
+Enables rmp-serde and allows server function to be called using raw messagepack bytes using ```with_bytes_thunk(bytes: &[u8])```
+
+#### Example
+
+```rust
+let bytes = rmp_serde::to_vec(AddArgs { a: 5, b: 5 }).unwrap();
+add_messagepack_thunk(&bytes) // should return 10
+```

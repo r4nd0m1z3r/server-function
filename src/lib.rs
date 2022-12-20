@@ -4,7 +4,14 @@
 use convert_case::{Case, Casing};
 use proc_macro::TokenStream as TokenStreamV1;
 use proc_macro2::{Delimiter, Ident, TokenStream as TokenStreamV2, TokenTree};
-use quote::{format_ident, quote};
+use quote::{format_ident, quote, TokenStreamExt};
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+enum ThunkType {
+    Default,
+    MessagePack,
+}
 
 #[derive(Debug)]
 struct FnData {
@@ -51,7 +58,6 @@ impl FnData {
         let mut return_type_token_index = None;
         let mut is_next_token_return_type = false;
         let return_type = tokens_iter.array_chunks::<2>().find(|[token1, token2]| {
-            dbg!(token1, token2);
             if is_next_token_return_type {
                 return true;
             }
@@ -121,7 +127,7 @@ fn generate_struct(
 
     Some((
         quote! {
-            #[derive(Deserialize, Debug)]
+            #[derive(Serialize, Deserialize, Debug)]
             struct #struct_name {
                 #fn_args_tokens
             }
@@ -130,37 +136,10 @@ fn generate_struct(
     ))
 }
 
-fn generate_thunk(
-    fn_data: &FnData,
-    struct_name: &Ident,
-    mut tokens_iter: impl Iterator<Item = TokenTree>,
-) -> Option<TokenStreamV2> {
-    let FnData {
-        is_async,
-        name,
-        return_type,
-    } = fn_data;
-
-    let thunk_name = format_ident!("{}_thunk", name);
-
-    let struct_tokens = {
-        let struct_group = tokens_iter.find(|token_tree| {
-            if let TokenTree::Group(group) = token_tree {
-                group.delimiter() == Delimiter::Brace
-            } else {
-                false
-            }
-        })?;
-        if let TokenTree::Group(group) = struct_group {
-            group.stream()
-        } else {
-            return None;
-        }
-    };
-
+fn get_struct_field_names(tokens_iter: impl Iterator<Item = TokenTree>) -> Option<TokenStreamV2> {
     let mut should_filter_next = false;
-    let unwrap_stream = struct_tokens
-        .into_iter()
+
+    let variable_names_tokens = tokens_iter
         .filter(|token_tree| {
             if should_filter_next {
                 should_filter_next = false;
@@ -178,36 +157,116 @@ fn generate_thunk(
         })
         .collect::<TokenStreamV2>();
 
-    if let Some(return_type) = return_type {
-        if *is_async {
-            Some(quote! {
-                async fn #thunk_name (args: #struct_name) -> #return_type {
-                    let #struct_name { #unwrap_stream } = args;
-                    #name(#unwrap_stream).await
-                }
-            })
-        } else {
-            Some(quote! {
-                fn #thunk_name (args: #struct_name) -> #return_type {
-                    let #struct_name { #unwrap_stream } = args;
-                    #name(#unwrap_stream)
-                }
-            })
-        }
-    } else if *is_async {
-        Some(quote! {
-            async fn #thunk_name (args: #struct_name) {
-                let #struct_name { #unwrap_stream } = args;
-                #name(#unwrap_stream).await;
-            }
-        })
+    if variable_names_tokens.is_empty() {
+        None
     } else {
-        Some(quote! {
-            fn #thunk_name (args: #struct_name) {
-                let #struct_name { #unwrap_stream } = args;
-                #name(#unwrap_stream);
+        Some(variable_names_tokens)
+    }
+}
+
+fn get_struct_fields(mut tokens_iter: impl Iterator<Item = TokenTree>) -> Option<TokenStreamV2> {
+    let struct_fields_group = tokens_iter.find(|token_tree| {
+        if let TokenTree::Group(group) = token_tree {
+            group.delimiter() == Delimiter::Brace
+        } else {
+            false
+        }
+    })?;
+
+    if let TokenTree::Group(group) = struct_fields_group {
+        let stream = group.stream();
+
+        if stream.is_empty() {
+            None
+        } else {
+            Some(stream)
+        }
+    } else {
+        None
+    }
+}
+
+fn generate_thunk(
+    fn_data: &FnData,
+    struct_name: &Ident,
+    tokens_iter: impl Iterator<Item = TokenTree>,
+    thunk_type: ThunkType,
+) -> Option<TokenStreamV2> {
+    let FnData {
+        is_async,
+        name,
+        return_type,
+    } = fn_data;
+
+    let thunk_name = match thunk_type {
+        ThunkType::Default => format_ident!("{}_thunk", name),
+        ThunkType::MessagePack => format_ident!("{}_messagepack_thunk", name),
+    };
+
+    let struct_fields_tokens = get_struct_fields(tokens_iter);
+
+    let variable_names_tokens = if struct_fields_tokens.is_some() {
+        get_struct_field_names(struct_fields_tokens?.into_iter())
+    } else {
+        None
+    };
+
+    let fn_prefix = if *is_async {
+        quote!(async fn)
+    } else {
+        quote!(fn)
+    };
+
+    let args_token_stream = if variable_names_tokens.is_none() {
+        quote!(())
+    } else {
+        match thunk_type {
+            ThunkType::Default => quote!((args: #struct_name)),
+            ThunkType::MessagePack => quote!((bytes: &[u8])),
+        }
+    };
+
+    let return_type_stream = if return_type.is_none() {
+        quote!()
+    } else {
+        quote!(-> #return_type)
+    };
+
+    let struct_unwrap_tokens = if variable_names_tokens.is_none() {
+        quote!()
+    } else {
+        quote!(let #struct_name { #variable_names_tokens } = args;)
+    };
+
+    let mut call_token_stream = if *is_async {
+        quote!(#name(#variable_names_tokens).await)
+    } else {
+        quote!(#name(#variable_names_tokens))
+    };
+    if return_type.is_none() {
+        call_token_stream.append_all(quote!(;));
+    }
+
+    match thunk_type {
+        ThunkType::Default => Some(quote! {
+            #fn_prefix #thunk_name #args_token_stream #return_type_stream {
+                #struct_unwrap_tokens
+                #call_token_stream
             }
-        })
+        }),
+        ThunkType::MessagePack => {
+            if variable_names_tokens.is_some() {
+                Some(quote! {
+                    #fn_prefix #thunk_name #args_token_stream #return_type_stream {
+                        let args = rmp_serde::from_slice(bytes).unwrap();
+                        #struct_unwrap_tokens
+                        #call_token_stream
+                    }
+                })
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -218,15 +277,37 @@ pub fn server_function(_attr: TokenStreamV1, item: TokenStreamV1) -> TokenStream
 
     let fn_data =
         FnData::from_token_stream(item.clone()).expect("Failed to extract function data!");
-    dbg!(&fn_data);
     let (args_struct, args_struct_name) = generate_struct(&fn_data.name, &mut item_iter)
         .expect("Failed to generate function arguments struct!");
-    let thunk = generate_thunk(&fn_data, &args_struct_name, args_struct.clone().into_iter())
-        .expect("Failed to generate function thunk!");
+    let thunk = generate_thunk(
+        &fn_data,
+        &args_struct_name,
+        args_struct.clone().into_iter(),
+        ThunkType::Default,
+    )
+    .expect("Failed to generate function thunk!");
 
+    #[cfg(not(feature = "messagepack"))]
+    return quote! {
+        #args_struct
+        #thunk
+
+        #item
+    }
+    .into();
+
+    #[cfg(feature = "messagepack")]
+    let messagepack_thunk = generate_thunk(
+        &fn_data,
+        &args_struct_name,
+        args_struct.clone().into_iter(),
+        ThunkType::MessagePack,
+    );
+    #[cfg(feature = "messagepack")]
     quote! {
         #args_struct
         #thunk
+        #messagepack_thunk
 
         #item
     }
